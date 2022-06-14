@@ -6,9 +6,6 @@ test:
 test-race:
 	go test ./... -race
 
-lint:
-	golangci-lint run
-
 doc: README.md
 
 README.md: README.md.tpl $(wildcard *.go)
