@@ -53,11 +53,12 @@ func (c *Client) Obtain(key string, ttl time.Duration, opt *Options) (*Lock, err
 	ctx := opt.getContext()
 	retry := opt.getRetryStrategy()
 
-	var cancel context.CancelFunc = func() {}
+	// make sure we don't retry forever
 	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc = func() {}
 		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(ttl))
+		defer cancel()
 	}
-	defer cancel()
 
 	var timer *time.Timer
 	for {
@@ -91,10 +92,7 @@ func (c *Client) Obtain(key string, ttl time.Duration, opt *Options) (*Lock, err
 func (c *Client) obtain(key, value string, ttl time.Duration) (bool, error) {
 	var result string
 	err := c.client.Do(radix.FlatCmd(&result, "SET", key, value, "PX", ttl.Milliseconds(), "NX"))
-	if err != nil {
-		return false, err
-	}
-	return result == "OK", nil
+	return result == "OK", err
 }
 
 func (c *Client) randomToken() (string, error) {
@@ -144,10 +142,7 @@ func (l *Lock) Metadata() string {
 func (l *Lock) TTL() (time.Duration, error) {
 	var num int64
 	err := l.client.client.Do(luaPTTL.Cmd(&num, l.key, l.value))
-	if err != nil {
-		return 0, err
-	}
-	if num < 0 {
+	if err != nil || num < 0 {
 		return 0, nil
 	}
 	return time.Duration(num) * time.Millisecond, nil
@@ -156,21 +151,18 @@ func (l *Lock) TTL() (time.Duration, error) {
 // Refresh extends the lock with a new TTL.
 // May return ErrNotObtained if refresh is unsuccessful.
 func (l *Lock) Refresh(ttl time.Duration, opt *Options) error {
-	status := false
+	var status bool
 	err := l.client.client.Do(luaRefresh.Cmd(&status, l.key, l.value, strconv.FormatInt(ttl.Milliseconds(), 10)))
-	if err != nil {
+	if err != nil || status {
 		return err
 	}
-	if !status {
-		return ErrNotObtained
-	}
-	return nil
+	return ErrNotObtained
 }
 
 // Release manually releases the lock.
 // May return ErrLockNotHeld.
 func (l *Lock) Release() error {
-	num := 0
+	var num int
 	err := l.client.client.Do(luaRelease.Cmd(&num, l.key, l.value))
 	if err != nil {
 		return err

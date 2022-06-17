@@ -1,4 +1,5 @@
 # redislock
+This is a fork of https://github.com/bsm/redislock that replaces go-redis with radix.
 
 Simplified distributed locking implementation using Redis with [radix](https://github.com/mediocregopher/radix) as client. For more information, please see examples.
 

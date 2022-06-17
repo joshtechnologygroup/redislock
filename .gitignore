@@ -85,3 +85,9 @@ ssl
 nbproject
 .history
 cookie-jar.txt
+
+############################
+# App
+############################
+
+.gopath
