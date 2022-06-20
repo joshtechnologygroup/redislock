@@ -55,7 +55,7 @@ func (c *Client) Obtain(key string, ttl time.Duration, opt *Options) (*Lock, err
 
 	// make sure we don't retry forever
 	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc = func() {}
+		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(ttl))
 		defer cancel()
 	}
@@ -177,7 +177,7 @@ func (l *Lock) Release() error {
 
 // Options describe the options for the lock
 type Options struct {
-	// RetryStrategy allows to customise the lock retry strategy.
+	// RetryStrategy allows to customize the lock retry strategy.
 	// Default: do not retry
 	RetryStrategy RetryStrategy
 
@@ -186,7 +186,7 @@ type Options struct {
 
 	// Context provides an optional context for timeout and cancellation control.
 	// If requested, Obtain will by default retry until the TTL expires. This
-	// behaviour can be tweaked with a custom context deadline.
+	// behavior can be tweaked with a custom context deadline.
 	Context context.Context
 }
 
@@ -213,7 +213,7 @@ func (o *Options) getRetryStrategy() RetryStrategy {
 
 // --------------------------------------------------------------------
 
-// RetryStrategy allows to customise the lock retry strategy.
+// RetryStrategy allows to customize the lock retry strategy.
 type RetryStrategy interface {
 	// NextBackoff returns the next backoff duration.
 	NextBackoff() time.Duration
