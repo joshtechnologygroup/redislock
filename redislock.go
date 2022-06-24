@@ -164,13 +164,10 @@ func (l *Lock) Refresh(ttl time.Duration, opt *Options) error {
 func (l *Lock) Release() error {
 	var num int
 	err := l.client.client.Do(luaRelease.Cmd(&num, l.key, l.value))
-	if err != nil {
+	if err != nil || num == 1 {
 		return err
 	}
-	if num != 1 {
-		return ErrLockNotHeld
-	}
-	return nil
+	return ErrLockNotHeld
 }
 
 // --------------------------------------------------------------------
