@@ -143,7 +143,7 @@ func (l *Lock) TTL() (time.Duration, error) {
 	var num int64
 	err := l.client.client.Do(luaPTTL.Cmd(&num, l.key, l.value))
 	if err != nil || num < 0 {
-		return 0, nil
+		return 0, err
 	}
 	return time.Duration(num) * time.Millisecond, nil
 }
