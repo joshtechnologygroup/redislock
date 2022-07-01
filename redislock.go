@@ -11,13 +11,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/mediocregopher/radix/v3"
 )
 
 var (
-	luaRefresh = redis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end`)
-	luaRelease = redis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`)
-	luaPTTL    = redis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pttl", KEYS[1]) else return -3 end`)
+	luaRefresh = radix.NewEvalScript(1, `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end`)
+	luaRelease = radix.NewEvalScript(1, `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`)
+	luaPTTL    = radix.NewEvalScript(1, `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pttl", KEYS[1]) else return -3 end`)
 )
 
 var (
@@ -28,30 +28,21 @@ var (
 	ErrLockNotHeld = errors.New("redislock: lock not held")
 )
 
-// RedisClient is a minimal client interface.
-type RedisClient interface {
-	SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.BoolCmd
-	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
-	EvalSha(ctx context.Context, sha1 string, keys []string, args ...interface{}) *redis.Cmd
-	ScriptExists(ctx context.Context, scripts ...string) *redis.BoolSliceCmd
-	ScriptLoad(ctx context.Context, script string) *redis.StringCmd
-}
-
 // Client wraps a redis client.
 type Client struct {
-	client RedisClient
+	client radix.Client
 	tmp    []byte
 	tmpMu  sync.Mutex
 }
 
 // New creates a new Client instance with a custom namespace.
-func New(client RedisClient) *Client {
+func New(client radix.Client) *Client {
 	return &Client{client: client}
 }
 
 // Obtain tries to obtain a new lock using a key with the given TTL.
 // May return ErrNotObtained if not successful.
-func (c *Client) Obtain(ctx context.Context, key string, ttl time.Duration, opt *Options) (*Lock, error) {
+func (c *Client) Obtain(key string, ttl time.Duration, opt *Options) (*Lock, error) {
 	// Create a random token
 	token, err := c.randomToken()
 	if err != nil {
@@ -59,6 +50,7 @@ func (c *Client) Obtain(ctx context.Context, key string, ttl time.Duration, opt 
 	}
 
 	value := token + opt.getMetadata()
+	ctx := opt.getContext()
 	retry := opt.getRetryStrategy()
 
 	// make sure we don't retry forever
@@ -70,7 +62,7 @@ func (c *Client) Obtain(ctx context.Context, key string, ttl time.Duration, opt 
 
 	var timer *time.Timer
 	for {
-		ok, err := c.obtain(ctx, key, value, ttl)
+		ok, err := c.obtain(key, value, ttl)
 		if err != nil {
 			return nil, err
 		} else if ok {
@@ -97,8 +89,10 @@ func (c *Client) Obtain(ctx context.Context, key string, ttl time.Duration, opt 
 	}
 }
 
-func (c *Client) obtain(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
-	return c.client.SetNX(ctx, key, value, ttl).Result()
+func (c *Client) obtain(key, value string, ttl time.Duration) (bool, error) {
+	var result string
+	err := c.client.Do(radix.FlatCmd(&result, "SET", key, value, "PX", ttl.Milliseconds(), "NX"))
+	return result == "OK", err
 }
 
 func (c *Client) randomToken() (string, error) {
@@ -125,8 +119,8 @@ type Lock struct {
 }
 
 // Obtain is a short-cut for New(...).Obtain(...).
-func Obtain(ctx context.Context, client RedisClient, key string, ttl time.Duration, opt *Options) (*Lock, error) {
-	return New(client).Obtain(ctx, key, ttl, opt)
+func Obtain(client radix.Client, key string, ttl time.Duration, opt *Options) (*Lock, error) {
+	return New(client).Obtain(key, ttl, opt)
 }
 
 // Key returns the redis key used by the lock.
@@ -145,59 +139,52 @@ func (l *Lock) Metadata() string {
 }
 
 // TTL returns the remaining time-to-live. Returns 0 if the lock has expired.
-func (l *Lock) TTL(ctx context.Context) (time.Duration, error) {
-	res, err := luaPTTL.Run(ctx, l.client.client, []string{l.key}, l.value).Result()
-	if err == redis.Nil {
-		return 0, nil
-	} else if err != nil {
+func (l *Lock) TTL() (time.Duration, error) {
+	var num int64
+	err := l.client.client.Do(luaPTTL.Cmd(&num, l.key, l.value))
+	if err != nil || num < 0 {
 		return 0, err
 	}
-
-	if num := res.(int64); num > 0 {
-		return time.Duration(num) * time.Millisecond, nil
-	}
-	return 0, nil
+	return time.Duration(num) * time.Millisecond, nil
 }
 
 // Refresh extends the lock with a new TTL.
 // May return ErrNotObtained if refresh is unsuccessful.
-func (l *Lock) Refresh(ctx context.Context, ttl time.Duration, opt *Options) error {
-	ttlVal := strconv.FormatInt(int64(ttl/time.Millisecond), 10)
-	status, err := luaRefresh.Run(ctx, l.client.client, []string{l.key}, l.value, ttlVal).Result()
-	if err != nil {
+func (l *Lock) Refresh(ttl time.Duration, opt *Options) error {
+	var status bool
+	err := l.client.client.Do(luaRefresh.Cmd(&status, l.key, l.value, strconv.FormatInt(ttl.Milliseconds(), 10)))
+	if err != nil || status {
 		return err
-	} else if status == int64(1) {
-		return nil
 	}
 	return ErrNotObtained
 }
 
 // Release manually releases the lock.
 // May return ErrLockNotHeld.
-func (l *Lock) Release(ctx context.Context) error {
-	res, err := luaRelease.Run(ctx, l.client.client, []string{l.key}, l.value).Result()
-	if err == redis.Nil {
-		return ErrLockNotHeld
-	} else if err != nil {
+func (l *Lock) Release() error {
+	var num int
+	err := l.client.client.Do(luaRelease.Cmd(&num, l.key, l.value))
+	if err != nil || num == 1 {
 		return err
 	}
-
-	if i, ok := res.(int64); !ok || i != 1 {
-		return ErrLockNotHeld
-	}
-	return nil
+	return ErrLockNotHeld
 }
 
 // --------------------------------------------------------------------
 
 // Options describe the options for the lock
 type Options struct {
-	// RetryStrategy allows to customise the lock retry strategy.
+	// RetryStrategy allows to customize the lock retry strategy.
 	// Default: do not retry
 	RetryStrategy RetryStrategy
 
 	// Metadata string is appended to the lock token.
 	Metadata string
+
+	// Context provides an optional context for timeout and cancellation control.
+	// If requested, Obtain will by default retry until the TTL expires. This
+	// behavior can be tweaked with a custom context deadline.
+	Context context.Context
 }
 
 func (o *Options) getMetadata() string {
@@ -205,6 +192,13 @@ func (o *Options) getMetadata() string {
 		return o.Metadata
 	}
 	return ""
+}
+
+func (o *Options) getContext() context.Context {
+	if o != nil && o.Context != nil {
+		return o.Context
+	}
+	return context.Background()
 }
 
 func (o *Options) getRetryStrategy() RetryStrategy {
@@ -216,7 +210,7 @@ func (o *Options) getRetryStrategy() RetryStrategy {
 
 // --------------------------------------------------------------------
 
-// RetryStrategy allows to customise the lock retry strategy.
+// RetryStrategy allows to customize the lock retry strategy.
 type RetryStrategy interface {
 	// NextBackoff returns the next backoff duration.
 	NextBackoff() time.Duration

@@ -1,273 +1,197 @@
 package redislock_test
 
 import (
-	"context"
-	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	. "github.com/bsm/redislock"
-	"github.com/go-redis/redis/v8"
+	"github.com/joshtechnologygroup/redislock"
+	"github.com/mediocregopher/radix/v3"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
 )
 
-const lockKey = "__bsm_redislock_unit_test__"
+const lockKey = "__joshtechnology_redislock_unit_test__"
 
-var redisOpts = &redis.Options{
-	Network: "tcp",
-	Addr:    "127.0.0.1:6379", DB: 9,
-}
+var _ = Describe("Client", func() {
+	var subject *redislock.Client
 
-func TestClient(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	// init client
-	client := New(rc)
-
-	// obtain
-	lock, err := client.Obtain(ctx, lockKey, time.Hour, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Release(ctx)
-
-	if exp, got := 22, len(lock.Token()); exp != got {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
-
-	// check TTL
-	assertTTL(t, lock, time.Hour)
-
-	// try to obtain again
-	_, err = client.Obtain(ctx, lockKey, time.Hour, nil)
-	if exp, got := ErrNotObtained, err; !errors.Is(got, exp) {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
-
-	// manually unlock
-	if err := lock.Release(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// lock again
-	lock, err = client.Obtain(ctx, lockKey, time.Hour, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Release(ctx)
-}
-
-func TestObtain(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	lock := quickObtain(t, rc, time.Hour)
-	if err := lock.Release(ctx); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestObtain_metadata(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	meta := "my-data"
-	lock, err := Obtain(ctx, rc, lockKey, time.Hour, &Options{Metadata: meta})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Release(ctx)
-
-	if exp, got := meta, lock.Metadata(); exp != got {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
-}
-
-func TestObtain_retry_success(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	// obtain for 20ms
-	lock1 := quickObtain(t, rc, 20*time.Millisecond)
-	defer lock1.Release(ctx)
-
-	// lock again with linar retry - 3x for 20ms
-	lock2, err := Obtain(ctx, rc, lockKey, time.Hour, &Options{
-		RetryStrategy: LimitRetry(LinearBackoff(20*time.Millisecond), 3),
+	BeforeEach(func() {
+		subject = redislock.New(redisClient)
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock2.Release(ctx)
-}
 
-func TestObtain_retry_failure(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	// obtain for 50ms
-	lock1 := quickObtain(t, rc, 50*time.Millisecond)
-	defer lock1.Release(ctx)
-
-	// lock again with linar retry - 2x for 5ms
-	_, err := Obtain(ctx, rc, lockKey, time.Hour, &Options{
-		RetryStrategy: LimitRetry(LinearBackoff(5*time.Millisecond), 2),
+	AfterEach(func() {
+		Expect(redisClient.Do(radix.FlatCmd(nil, "DEL", lockKey))).To(Succeed())
 	})
-	if exp, got := ErrNotObtained, err; !errors.Is(got, exp) {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
-}
 
-func TestObtain_concurrent(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
+	It("should obtain once with TTL", func() {
+		lock1, err := subject.Obtain(lockKey, time.Hour, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(lock1.Token()).To(HaveLen(22))
+		Expect(lock1.TTL()).To(BeNumerically("~", time.Hour, time.Second))
+		defer lock1.Release()
 
-	numLocks := int32(0)
-	numThreads := 100
-	wg := new(sync.WaitGroup)
-	errs := make(chan error, numThreads)
-	for i := 0; i < numThreads; i++ {
-		wg.Add(1)
+		_, err = subject.Obtain(lockKey, time.Hour, nil)
+		Expect(err).To(Equal(redislock.ErrNotObtained))
+		Expect(lock1.Release()).To(Succeed())
 
-		go func() {
-			defer wg.Done()
+		lock2, err := subject.Obtain(lockKey, time.Minute, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(lock2.TTL()).To(BeNumerically("~", time.Minute, time.Second))
+		Expect(lock2.Release()).To(Succeed())
+	})
 
-			wait := rand.Int63n(int64(10 * time.Millisecond))
-			time.Sleep(time.Duration(wait))
+	It("should obtain through short-cut", func() {
+		lock, err := redislock.Obtain(redisClient, lockKey, time.Hour, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(lock.Release()).To(Succeed())
+	})
 
-			_, err := Obtain(ctx, rc, lockKey, time.Minute, nil)
-			if err == ErrNotObtained {
-				return
-			} else if err != nil {
-				errs <- err
-			} else {
+	It("should support custom metadata", func() {
+		lock, err := redislock.Obtain(redisClient, lockKey, time.Hour, &redislock.Options{Metadata: "my-data"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(lock.Metadata()).To(Equal("my-data"))
+		Expect(lock.Release()).To(Succeed())
+	})
+
+	It("should refresh", func() {
+		lock, err := redislock.Obtain(redisClient, lockKey, time.Minute, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(lock.TTL()).To(BeNumerically("~", time.Minute, time.Second))
+		Expect(lock.Refresh(time.Hour, nil)).To(Succeed())
+		Expect(lock.TTL()).To(BeNumerically("~", time.Hour, time.Second))
+		Expect(lock.Release()).To(Succeed())
+	})
+
+	It("should fail to release if expired", func() {
+		lock, err := redislock.Obtain(redisClient, lockKey, time.Millisecond, nil)
+		Expect(err).NotTo(HaveOccurred())
+		time.Sleep(5 * time.Millisecond)
+		Expect(lock.Release()).To(MatchError(redislock.ErrLockNotHeld))
+	})
+
+	It("should fail to release if ontained by someone else", func() {
+		lock, err := redislock.Obtain(redisClient, lockKey, time.Minute, nil)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
+		Expect(lock.Release()).To(MatchError(redislock.ErrLockNotHeld))
+	})
+
+	It("should fail to refresh if expired", func() {
+		lock, err := redislock.Obtain(redisClient, lockKey, time.Millisecond, nil)
+		Expect(err).NotTo(HaveOccurred())
+		time.Sleep(5 * time.Millisecond)
+		Expect(lock.Refresh(time.Hour, nil)).To(MatchError(redislock.ErrNotObtained))
+	})
+
+	It("should retry if enabled", func() {
+		// retry, succeed
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "PEXPIRE", lockKey, (20 * time.Millisecond).Milliseconds()))).NotTo(HaveOccurred())
+
+		lock, err := redislock.Obtain(redisClient, lockKey, time.Hour, &redislock.Options{
+			RetryStrategy: redislock.LimitRetry(redislock.LinearBackoff(100*time.Millisecond), 3),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(lock.Release()).To(Succeed())
+
+		// no retry, fail
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "PEXPIRE", lockKey, (50 * time.Millisecond).Milliseconds()))).NotTo(HaveOccurred())
+
+		_, err = redislock.Obtain(redisClient, lockKey, time.Hour, nil)
+		Expect(err).To(MatchError(redislock.ErrNotObtained))
+
+		// retry 2x, give up & fail
+		Expect(redisClient.Do(radix.FlatCmd(nil, "SET", lockKey, "ABCD"))).NotTo(HaveOccurred())
+		Expect(redisClient.Do(radix.FlatCmd(nil, "PEXPIRE", lockKey, (50 * time.Millisecond).Milliseconds()))).NotTo(HaveOccurred())
+
+		_, err = redislock.Obtain(redisClient, lockKey, time.Hour, &redislock.Options{
+			RetryStrategy: redislock.LimitRetry(redislock.LinearBackoff(time.Millisecond), 2),
+		})
+		Expect(err).To(MatchError(redislock.ErrNotObtained))
+	})
+
+	It("should prevent multiple locks (fuzzing)", func() {
+		numLocks := int32(0)
+		wg := new(sync.WaitGroup)
+		for i := 0; i < 1000; i++ {
+			wg.Add(1)
+
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+
+				wait := rand.Int63n(int64(50 * time.Millisecond))
+				time.Sleep(time.Duration(wait))
+
+				_, err := subject.Obtain(lockKey, time.Minute, nil)
+				if err == redislock.ErrNotObtained {
+					return
+				}
+				Expect(err).NotTo(HaveOccurred())
 				atomic.AddInt32(&numLocks, 1)
-			}
-		}()
-	}
-	wg.Wait()
+			}()
+		}
+		wg.Wait()
+		Expect(numLocks).To(Equal(int32(1)))
+	})
 
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
-	}
-	if exp, got := 1, int(numLocks); exp != got {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
+})
+
+var _ = Describe("RetryStrategy", func() {
+	It("should support no-retry", func() {
+		subject := redislock.NoRetry()
+		Expect(subject.NextBackoff()).To(Equal(time.Duration(0)))
+	})
+
+	It("should support linear backoff", func() {
+		subject := redislock.LinearBackoff(time.Second)
+		Expect(subject.NextBackoff()).To(Equal(time.Second))
+		Expect(subject.NextBackoff()).To(Equal(time.Second))
+	})
+
+	It("should support limits", func() {
+		subject := redislock.LimitRetry(redislock.LinearBackoff(time.Second), 2)
+		Expect(subject.NextBackoff()).To(Equal(time.Second))
+		Expect(subject.NextBackoff()).To(Equal(time.Second))
+		Expect(subject.NextBackoff()).To(Equal(time.Duration(0)))
+	})
+
+	It("should support exponential backoff", func() {
+		subject := redislock.ExponentialBackoff(10*time.Millisecond, 300*time.Millisecond)
+		Expect(subject.NextBackoff()).To(Equal(10 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(10 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(16 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(32 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(64 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(128 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(256 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(300 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(300 * time.Millisecond))
+		Expect(subject.NextBackoff()).To(Equal(300 * time.Millisecond))
+	})
+})
+
+// --------------------------------------------------------------------
+
+func TestSuite(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "redislock")
 }
 
-func TestLock_Refresh(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
+var redisClient radix.Client
 
-	lock := quickObtain(t, rc, time.Hour)
-	defer lock.Release(ctx)
+var _ = BeforeSuite(func() {
+	var err error
+	redisClient, err = radix.NewPool("tcp", "127.0.0.1:6379", 10)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(redisClient.Do(radix.Cmd(nil, "PING", ""))).To(Succeed())
+})
 
-	// check TTL
-	assertTTL(t, lock, time.Hour)
-
-	// update TTL
-	if err := lock.Refresh(ctx, time.Minute, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	// check TTL again
-	assertTTL(t, lock, time.Minute)
-}
-
-func TestLock_Refresh_expired(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	lock := quickObtain(t, rc, 5*time.Millisecond)
-	defer lock.Release(ctx)
-
-	// try releasing
-	time.Sleep(10 * time.Millisecond)
-	if exp, got := ErrNotObtained, lock.Refresh(ctx, time.Minute, nil); !errors.Is(got, exp) {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
-}
-
-func TestLock_Release_expired(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	lock := quickObtain(t, rc, 5*time.Millisecond)
-	defer lock.Release(ctx)
-
-	// try releasing
-	time.Sleep(10 * time.Millisecond)
-	if exp, got := ErrLockNotHeld, lock.Release(ctx); !errors.Is(got, exp) {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
-}
-
-func TestLock_Release_not_own(t *testing.T) {
-	ctx := context.Background()
-	rc := redis.NewClient(redisOpts)
-	defer teardown(t, rc)
-
-	lock := quickObtain(t, rc, time.Hour)
-	defer lock.Release(ctx)
-
-	// manually transfer ownership
-	if err := rc.Set(ctx, lockKey, "ABCD", 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-
-	// try releasing
-	if exp, got := ErrLockNotHeld, lock.Release(ctx); !errors.Is(got, exp) {
-		t.Fatalf("expected %v, got %v", exp, got)
-	}
-}
-
-func quickObtain(t *testing.T, rc *redis.Client, ttl time.Duration) *Lock {
-	t.Helper()
-
-	lock, err := Obtain(context.Background(), rc, lockKey, ttl, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return lock
-}
-
-func assertTTL(t *testing.T, lock *Lock, exp time.Duration) {
-	t.Helper()
-
-	ttl, err := lock.TTL(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	delta := ttl - exp
-	if delta < 0 {
-		delta = 1 - delta
-	}
-	if delta > time.Second {
-		t.Fatalf("expected ~%v, got %v", exp, ttl)
-	}
-}
-
-func teardown(t *testing.T, rc *redis.Client) {
-	t.Helper()
-
-	if err := rc.Del(context.Background(), lockKey).Err(); err != nil {
-		t.Fatal(err)
-	}
-	if err := rc.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
+var _ = AfterSuite(func() {
+	Expect(redisClient.Close()).To(Succeed())
+})
